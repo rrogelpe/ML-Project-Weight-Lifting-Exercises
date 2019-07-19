@@ -1,0 +1,169 @@
+---
+title: "Prediciting Fashion of Weight Lifting Exercise"
+author: "Rodrigo Rogel-Perez"
+date: "July 14, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(skimr)
+library(dplyr)
+library(mlbench)
+```
+
+```{r include=FALSE}
+# Parallel processing libraries
+library(parallel)
+library(doParallel)
+# Parallel processing setup
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+```
+
+## Overview
+
+In this report, we analyze data from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants and build a model that classifies a set of measurements corresponding to one unilateral dumbbell biceps curl repetition as one of five fashions. The dataset captures measurements for exactly five differennt fashions; exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E) [1]. Of the five, Class A holds measurements corresponding to the correct execution of the exercise while the others are common mistakes (*Quality Activity Recognition of Weight Lifting Exercises 2013*). For our model, we used repeated cross-validation to obtain more accuracy at the expense of run-time, and the random forest classification algorithm. In the last section, we look at the accuracy and Kappa value to evaluate our model.
+
+## Getting Training and Testing Datasets
+
+The full dataset can be downloaded from the web and is provided by E. Velloso, A. Bulling, H. Gellersen, W. Ugulino, and H. Fuks. The dataset was introduced in their paper titled, *Quality Activity Recognition of Weight Lifting Exercises* (2013). We create a 80%-20% data partition and call the larger partition the training set. We use only the training set to build our model.
+
+```{r}
+# Download full dataset
+fulldat <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", header = T)
+# Create an 80%20% data partition
+trainInd <- createDataPartition(fulldat[, "classe"], p = .8, list = FALSE)
+# Make training set the larger of the two partitions
+traindat <- fulldat[trainInd,]
+# Make testing set the smaller of the two partitions
+testdat <- fulldat[-trainInd,]
+# Download validation dataset
+valdat <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", header = T)
+```
+
+## Exploratory Data Analysis
+
+```{r include=TRUE, results='hide'}
+str(traindat)
+```
+
+```{r}
+# Return class type of each column
+cls <- sapply(traindat, class)
+# Return columns which contain integer values in training set
+integer_traindat <- traindat[, (cls == "integer" | cls == "numeric")]
+# Return column which contain integer or numeric values in testing set
+integer_testdat <- testdat[,(cls == "integer" | cls == "numeric")]
+```
+
+The dimensions of the dataset are 19,622 rows and 160 columns. Three column classes exist; **factor**, **integer**, and **numeric**. Most, if not all, classification algorithms take only numeric features as inputs. We identify **numeric** and **integer** features in the training and testing sets and create separate sets comprised of only these columns.
+
+```{r}
+# Count number of missing values in each column in training set
+na_counts_train <- sapply(integer_traindat, function(x) sum(is.na(x)))
+# Display NA count for the first 20 columns
+head(na_counts_train, 16)
+# Count number of missing values in each column in testing set
+na_counts_test <- sapply(integer_testdat, function(x) sum(is.na(x)))
+# Remove columns that are missing more than 50% of their values in training set
+integer_traindat <- integer_traindat[, which(na_counts_train < nrow(integer_traindat)/2)]
+# Remove columns that are missing more than 50% of their values in testing set
+integer_testdat <- integer_testdat[, which(na_counts_test < nrow(integer_testdat)/2)]
+```
+
+Next, we set out to determine the number of missing values in each column. The number of missing values in columns that have them is more than half the number of observations. This considered, we believe it would not be inappropriate to remove these columns, so we do it. Under different circumstances i.e. if the number of missing values was less than half the number of observations, we could have used the k-nearest neighbor algorithm to generate reasonable estimates, however, that is not practical here.
+
+```{r include=TRUE}
+# Remove first 4 columns because they are not helpful in predicting 
+integer_traindat <- integer_traindat[, -c(1:4)]
+# Remove first 4 columns because they are not helpful in predicting
+integer_testdat <- integer_testdat[, -c(1:4)]
+# Skim training dataset
+skimmed_train <- skim_to_wide(integer_traindat)
+# Skim testing dataset
+skimmed_test <- skim_to_wide(integer_testdat)
+# Return dataset showing number of missing values per column and the destribution of values
+print(skimmed_train, 6)
+```
+
+The first four columns of the dataset are not helpful for building our model as they are a combination of unique identifiers and date/time stamps. We can safely remove them.
+
+```{r eval=FALSE, echo=TRUE}
+# Plot response variables versus each feature
+for (i in 1:ncol(integer_traindat)) {
+     plot(traindat$classe, integer_traindat[, i], main = paste(paste(i, sep = " - ", 
+          names(integer_traindat)[i]), sep = " vs. ", "Class"))
+}
+# Generate correlation matrix of predictor variables
+cor_matrix <- cor(integer_traindat)
+# Show all correlations greater than .75 and less than 1 to help avoid multicollinearity
+which(abs(cor_matrix) > .75 & cor_matrix < 1)
+```
+
+Sets of five boxplots are generated, one set for every feature. Each boxplot shows the distribution of values of that feature and is associated with one of the five classes. Classes are distinguishable from one another in few features. A correlation matrix also reveals there are multiple features that are highly correlated with one another, though this is not a concern since we will not be doing a regression.
+
+## Building the Predictive Model
+
+```{r include=TRUE, results='hide'}
+# Calculate the pre-process parameters from the dataset
+preprocessParams <- preProcess(integer_traindat, method = c("center", "scale", "pca"))
+# Transform training dataset using the parameters
+transformed_train <- predict(preprocessParams, integer_traindat)
+# Transform testing dataset using the parameters
+transformed_test <- predict(preprocessParams, integer_testdat)
+# Add classification column to training set
+transformed_train[, "classe"] <- traindat[, "classe"]
+# Add classification column to testing set
+transformed_test[, "classe"] <- testdat[, "classe"]
+```
+
+We opt to preprocess the dataset using principal component analysis (PCA) given the high number of features. Prior to conducting the PCA, we scale and center the data. It's good practice if the data is not measured in the same units and could help produce a better model.
+
+```{r include=TRUE, results='hide'}
+# Set seed for reproducibility
+set.seed(42)
+# Set tuning parameters. We use repeated cross-validation for more accurary at the expense of run-time.
+train_control <- trainControl(method = "repeatedcv", 
+                              number = 10, 
+                              repeats = 3,
+                              allowParallel = TRUE)
+# Fit Random Forest Model.
+# RMSE not applicable as this is a classification problem. Accuracy and Kappa are more appropriate
+rfmodel <- train(classe ~ ., 
+                 transformed_train,
+                 method = "rf",
+                 metric = "Accuracy",
+                 trControl = train_control)
+```
+
+We select the random forest algorithm to train our model bacause it is robust against overfitting. Repeated 10-fold cross-validation is used to average the results and obtain a better model. Also, we specify the metric we wish to evalaute our model with, accuracy.
+
+```{r echo=FALSE}
+# We explicitly shut down the cluster
+stopCluster(cluster)
+# Required to force R to return to single threaded processing
+registerDoSEQ()
+```
+
+## Model Evaluation
+
+```{r include=TRUE}
+# Predict values in the test data set
+rfpredictions <- predict(rfmodel,transformed_test)
+# Print confusion matrix
+cm <- confusionMatrix(rfpredictions, transformed_test[, "classe"])
+# Print confusion matrix
+print(cm)
+# Store accuracy metric as percentage
+acc <- paste(round(cm$overall["Accuracy"] * 100, digits = 1), "%", sep = "")
+# Store Kappa value as a percentage
+kap <- paste(round(cm$overall["Kappa"] * 100, digits = 1), "%", sep = "")
+# Calculate sample error
+sample_err <- sum(rfpredictions != transformed_test[, "classe"])/nrow(transformed_test)
+# Store sample err as percentage
+sample_err_perc <- paste(round(sample_err * 100, digits = 1), "%", sep = "")
+```
+
+The model is then used to assign each observation in the testing set to a class. A confusion matrix reveals our model has an accuracy of `r acc` and Kappa value of `r kap`. In this particular execution, our model shows a sample error of `r sample_err_perc`. Since we used repeated 10-fold cross validation, we can say this also the expected sample error. 
